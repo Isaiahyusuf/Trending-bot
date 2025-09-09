@@ -1,0 +1,305 @@
+# trending_bot.py
+# Telegram Trending Bot (Multi-chain)
+# Requirements:
+#   pip install aiogram requests python-dotenv
+#
+# How to run:
+#   1) Create a .env file in the same folder with:
+#        BOT_TOKEN=123456789:YOUR_BOT_TOKEN_HERE
+#        ADMIN_USER_ID=123456789   # optional, for logs
+#        # Optionally set payment addresses (or set inside PAYMENT_ADDRESSES below)
+#        SOL_ADDRESS=YOUR_SOL_ADDRESS
+#        ETH_ADDRESS=YOUR_ETH_ADDRESS
+#        BSC_ADDRESS=YOUR_BSC_ADDRESS
+#        SUI_ADDRESS=YOUR_SUI_ADDRESS
+#        XRP_ADDRESS=YOUR_XRP_ADDRESS
+#   2) python trending_bot.py
+#
+# Notes:
+#  - The package prices are defined in SOL. We convert equivalents for other chains using CoinGecko.
+#  - If price fetch fails, we use fallback static prices in USD. Always verify before going live.
+#  - The flow is: /start -> pick chain -> enter Contract Address (CA) -> choose package -> show payment address.
+#
+# SECURITY:
+#  - Never hardcode your real BOT_TOKEN in code; use environment variables.
+#  - Consider limiting who can use admin commands (not included here to keep it simple).
+
+import os
+import math
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+import requests
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("trending-bot")
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")  # optional
+
+if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
+    logger.warning("BOT_TOKEN is not set! Put it in your .env file before going live.")
+
+# ====== CONFIG ======
+
+# Base packages defined in SOL
+@dataclass
+class Package:
+    sol_amount: float
+    hours: int
+
+BASE_PACKAGES: List[Package] = [
+    Package(3, 3),
+    Package(9, 6),
+    Package(21, 15),
+    Package(50, 24),
+    Package(100, 48),
+]
+
+# Supported chains and their CoinGecko IDs
+CHAINS = {
+    "SOLANA": {"coingecko_id": "solana", "symbol": "SOL"},
+    "ETHEREUM": {"coingecko_id": "ethereum", "symbol": "ETH"},
+    "BSC": {"coingecko_id": "binancecoin", "symbol": "BNB"},
+    "SUI": {"coingecko_id": "sui", "symbol": "SUI"},
+    "XRP": {"coingecko_id": "ripple", "symbol": "XRP"},
+}
+
+# Payment addresses placeholders (you will paste your real addresses later)
+PAYMENT_ADDRESSES: Dict[str, str] = {
+    "SOLANA": os.getenv("SOL_ADDRESS", "TO_BE_PROVIDED"),
+    "ETHEREUM": os.getenv("ETH_ADDRESS", "TO_BE_PROVIDED"),
+    "BSC": os.getenv("BSC_ADDRESS", "TO_BE_PROVIDED"),
+    "SUI": os.getenv("SUI_ADDRESS", "TO_BE_PROVIDED"),
+    "XRP": os.getenv("XRP_ADDRESS", "TO_BE_PROVIDED"),
+}
+
+COINGECKO_SIMPLE_PRICE = "https://api.coingecko.com/api/v3/simple/price"
+
+# Fallback USD prices if API is down (update these before going live)
+FALLBACK_PRICES_USD = {
+    "solana": 220.0,
+    "ethereum": 4350.0,
+    "binancecoin": 880.0,
+    "ripple": 3.0,
+    "sui": 3.6,
+}
+
+# In-memory sessions (use Redis/DB in production)
+user_sessions: Dict[int, Dict] = {}
+
+
+# ====== UTILITIES ======
+
+def fetch_usd_prices() -> Dict[str, float]:
+    ids = ",".join({cfg["coingecko_id"] for cfg in CHAINS.values()})
+    params = {"ids": ids, "vs_currencies": "usd"}
+    try:
+        r = requests.get(COINGECKO_SIMPLE_PRICE, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        prices = {}
+        for chain_key, cfg in CHAINS.items():
+            cid = cfg["coingecko_id"]
+            prices[cid] = float(data.get(cid, {}).get("usd", FALLBACK_PRICES_USD[cid]))
+        return prices
+    except Exception as e:
+        logger.warning(f"Price fetch failed, using fallbacks. Error: {e}")
+        return FALLBACK_PRICES_USD.copy()
+
+
+def format_token_amount(x: float) -> str:
+    """Pretty format a token amount: more decimals for small amounts."""
+    if x >= 1:
+        return f"{x:.4f}".rstrip("0").rstrip(".")
+    else:
+        return f"{x:.8f}".rstrip("0").rstrip(".")
+
+
+def convert_sol_to(chain_key: str, sol_amount: float, prices_usd: Dict[str, float]) -> float:
+    """Convert a SOL amount into target chain token amount using USD prices."""
+    sol_usd = prices_usd["solana"] * sol_amount
+    target_id = CHAINS[chain_key]["coingecko_id"]
+    target_price = prices_usd[target_id]
+    if target_price <= 0:
+        return 0.0
+    return sol_usd / target_price
+
+
+def start_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("Solana", callback_data="chain:SOLANA"),
+        InlineKeyboardButton("Ethereum", callback_data="chain:ETHEREUM"),
+        InlineKeyboardButton("BSC", callback_data="chain:BSC"),
+        InlineKeyboardButton("SUI", callback_data="chain:SUI"),
+        InlineKeyboardButton("XRP", callback_data="chain:XRP"),
+    )
+    return kb
+
+
+def packages_keyboard_for_chain(chain_key: str, prices_usd: Dict[str, float]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    sym = CHAINS[chain_key]["symbol"]
+
+    for idx, pkg in enumerate(BASE_PACKAGES):
+        if chain_key == "SOLANA":
+            amt = pkg.sol_amount
+        else:
+            amt = convert_sol_to(chain_key, pkg.sol_amount, prices_usd)
+        label_amt = format_token_amount(amt)
+        btn_text = f"{label_amt} {sym} â {pkg.hours} hrs"
+        kb.add(InlineKeyboardButton(btn_text, callback_data=f"pkg:{chain_key}:{idx}"))
+    kb.add(InlineKeyboardButton("â¬ï¸ Back to Chains", callback_data="back:chains"))
+    return kb
+
+
+def main_menu_text() -> str:
+    return (
+        "ð Welcome to the Trending Bot!\n\n"
+        "Choose your blockchain network to begin.\n\n"
+        "Flow: Start â Pick Chain â Send Contract Address (CA) â Choose Package â Get Payment Address."
+    )
+
+
+# ====== BOT SETUP ======
+
+bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
+dp = Dispatcher(bot)
+
+
+@dp.message_handler(commands=["start", "menu"])
+async def cmd_start(message: types.Message):
+    user_sessions[message.from_user.id] = {"state": "PICK_CHAIN"}
+    await message.answer(main_menu_text(), reply_markup=start_keyboard())
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("back:chains"))
+async def on_back_to_chains(call: types.CallbackQuery):
+    user_sessions[call.from_user.id] = {"state": "PICK_CHAIN"}
+    await call.message.edit_text(main_menu_text(), reply_markup=start_keyboard())
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("chain:"))
+async def on_chain_selected(call: types.CallbackQuery):
+    chain_key = call.data.split(":")[1]
+    session = user_sessions.setdefault(call.from_user.id, {})
+    session["state"] = "AWAIT_CA"
+    session["chain"] = chain_key
+    session["ca"] = None
+
+    await call.message.edit_text(
+        f"â <b>{chain_key.title()}</b> selected.\n\n"
+        f"Please send the <b>Contract Address (CA)</b> of the project you want to trend on <b>{chain_key.title()}</b>.\n\n"
+        f"Send it as a text message now."
+    )
+    await call.answer()
+
+
+@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get("state") == "AWAIT_CA")
+async def on_receive_ca(message: types.Message):
+    session = user_sessions[message.from_user.id]
+    chain_key = session.get("chain", "SOLANA")
+    ca_text = message.text.strip()
+
+    # Basic CA validation note (you can add stricter validation per chain)
+    if len(ca_text) < 10:
+        await message.reply("â ï¸ That CA looks too short. Please send a valid contract address.")
+        return
+
+    session["ca"] = ca_text
+    session["state"] = "CHOOSE_PACKAGE"
+
+    prices = fetch_usd_prices()
+    kb = packages_keyboard_for_chain(chain_key, prices)
+
+    await message.answer(
+        f"CA saved for <b>{chain_key.title()}</b>:\n<code>{ca_text}</code>\n\n"
+        f"Now choose a package below ð",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("pkg:"))
+async def on_package_selected(call: types.CallbackQuery):
+    _, chain_key, idx_str = call.data.split(":")
+    idx = int(idx_str)
+
+    session = user_sessions.get(call.from_user.id, {})
+    ca = session.get("ca")
+    if not ca:
+        await call.answer("Please provide your Contract Address (CA) first.", show_alert=True)
+        return
+
+    pkg = BASE_PACKAGES[idx]
+    prices = fetch_usd_prices()
+
+    if chain_key == "SOLANA":
+        amount = pkg.sol_amount
+    else:
+        amount = convert_sol_to(chain_key, pkg.sol_amount, prices)
+
+    sym = CHAINS[chain_key]["symbol"]
+    amount_str = format_token_amount(amount)
+    hours = pkg.hours
+
+    pay_addr = PAYMENT_ADDRESSES.get(chain_key, "TO_BE_PROVIDED")
+
+    sol_usd = prices["solana"] * pkg.sol_amount
+    usd_str = f"${sol_usd:,.2f}"
+
+    text = (
+        f"ð§¾ <b>Order Summary</b>\n"
+        f"Chain: <b>{chain_key.title()}</b>\n"
+        f"Package: <b>{amount_str} {sym} â {hours} hrs</b>\n"
+        f"Project CA: <code>{ca}</code>\n"
+        f"Est. USD value (based on SOL): <b>{usd_str}</b>\n\n"
+        f"ð© <b>Payment Address ({sym})</b>:\n<code>{pay_addr}</code>\n\n"
+        f"After payment, reply here with the <b>Tx Hash</b>.\n"
+    )
+
+    kb = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("â¬ï¸ Change Package", callback_data=f"change_pkg:{chain_key}")
+    ).add(
+        InlineKeyboardButton("â¬ï¸ Back to Chains", callback_data="back:chains")
+    )
+
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("change_pkg:"))
+async def on_change_package(call: types.CallbackQuery):
+    chain_key = call.data.split(":")[1]
+    prices = fetch_usd_prices()
+    kb = packages_keyboard_for_chain(chain_key, prices)
+    await call.message.edit_text("Choose a package ð", reply_markup=kb)
+    await call.answer()
+
+
+@dp.message_handler(commands=["help"])
+async def cmd_help(message: types.Message):
+    await message.reply(
+        "Help:\n"
+        "1) /start to begin.\n"
+        "2) Pick chain.\n"
+        "3) Send Contract Address (CA).\n"
+        "4) Choose package.\n"
+        "5) Pay to the shown address.\n\n"
+        "Admin can set payment addresses via environment variables or inside the code."
+    )
+
+
+async def on_startup(_):
+    logger.info("Bot is up.")
+
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
